@@ -26,7 +26,7 @@ from openai import OpenAI
 import config
 from extract import extract_page_text, find_mdna_section_with_position
 from collections import deque
-import transformers  # 添加transformers依赖
+import transformers
 
 # ===== Token计数器及速率限制设置 =====
 # 全局定义相关常量和历史记录
