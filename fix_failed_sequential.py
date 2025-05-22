@@ -8,7 +8,7 @@ PDF提取失败文件修复工具 - 顺序处理版本
 2. 使用API定位内容位置
 3. 根据位置信息从本地PDF文件提取内容
 4. 逐个处理PDF，不使用并发
-5. 精确计算token使用量，控制每分钟请求频率
+5. API请求失败时进行重试
 
 日期: 2025-05-22
 """
@@ -22,134 +22,9 @@ import argparse
 import sys
 import pdfplumber
 from tqdm import tqdm
-from openai import OpenAI
+from openai import OpenAI # 确保 OpenAI 被导入
 import config
 from extract import extract_page_text, find_mdna_section_with_position
-from collections import deque
-import transformers
-
-# ===== Token计数器及速率限制设置 =====
-# 全局定义相关常量和历史记录
-TOKENS_PER_MINUTE_LIMIT = 5000000  # DeepSeek-V3每分钟token限制
-REQUESTS_PER_MINUTE_LIMIT = 30000  # DeepSeek-V3每分钟请求数量限制
-RATE_LIMIT_THRESHOLD = 0.85  # 触发等待的API使用率阈值
-# token_usage_history 需要能容纳至少一分钟内最大请求数
-token_usage_history = deque(maxlen=REQUESTS_PER_MINUTE_LIMIT + 5000) # 例如 30000 + 5000 = 35000
-
-# 全局tokenizer变量
-tokenizer = None
-TOKEN_COUNTER_LOADED = False
-
-# 注意: 以下日志记录依赖于 logging 模块的基本配置或已由 setup_logging() 配置的 logger 实例。
-# 如果 setup_logging() 在此之后调用，这些早期日志可能行为不同。
-
-try:
-    tokenizer_dir = os.path.join(os.path.dirname(__file__), "deepseek_v3_tokenizer")
-    _tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
-    tokenizer = _tokenizer 
-    TOKEN_COUNTER_LOADED = True
-    logging.info("Token计数器初始化成功 (DeepSeek-V3).")
-except Exception as e:
-    logging.warning(f"警告: Token计数器 (DeepSeek-V3) 初始化失败 - {e}")
-    logging.warning("将使用估计方式计算token。请求速率限制仍将按配置工作。")
-    TOKEN_COUNTER_LOADED = False
-
-def count_tokens_real(text_to_count):
-    """使用实际加载的tokenizer计算token，带异常处理"""
-    if not text_to_count:
-        return 0
-    if not tokenizer: 
-        logging.warning("尝试使用实际tokenizer计数，但tokenizer未加载。返回估计值。")
-        return len(text_to_count) // 4
-    try:
-        tokens = tokenizer.encode(text_to_count)
-        return len(tokens)
-    except Exception as e:
-        logging.warning(f"使用DeepSeek-V3 tokenizer计算Token时出错: {e}. 对此文本回退到估计值。")
-        return len(text_to_count) // 4
-
-def count_tokens(text_to_count):
-    """根据TOKEN_COUNTER_LOADED状态选择真实计数或估算"""
-    if not text_to_count:
-        return 0
-    if TOKEN_COUNTER_LOADED and tokenizer: # Ensure tokenizer is not None
-        return count_tokens_real(text_to_count)
-    else:
-        return len(text_to_count) // 4
-
-def get_current_token_usage():
-    """获取当前一分钟内的总token使用量"""
-    now = time.time()
-    recent_usage = [tokens for timestamp, tokens in token_usage_history if now - timestamp < 60]
-    return sum(recent_usage)
-
-def get_current_request_count():
-    """获取当前一分钟内的请求次数"""
-    now = time.time()
-    return sum(1 for timestamp, _ in token_usage_history if now - timestamp < 60)
-
-def record_token_usage(input_text, output_text=None):
-    """记录API调用使用的token数量，并更新历史记录"""
-    input_tokens = count_tokens(input_text)
-    output_tokens = count_tokens(output_text) if output_text else 0
-    total_tokens = input_tokens + output_tokens
-    token_usage_history.append((time.time(), total_tokens))
-    return total_tokens
-
-def wait_for_token_limit():
-    """
-    检查API使用是否接近限制，如果接近则等待适当时间。
-    循环检查，直到用量低于阈值。
-    """
-    while True:
-        current_tokens = get_current_token_usage()
-        current_requests = get_current_request_count()
-
-        token_usage_percent = (current_tokens / TOKENS_PER_MINUTE_LIMIT) * 100 if TOKENS_PER_MINUTE_LIMIT > 0 else 0
-        request_usage_percent = (current_requests / REQUESTS_PER_MINUTE_LIMIT) * 100 if REQUESTS_PER_MINUTE_LIMIT > 0 else 0
-        
-        # logging.debug(f"当前API使用 - Tokens: {current_tokens:,}/{TOKENS_PER_MINUTE_LIMIT:,} ({token_usage_percent:.2f}%), "
-        #             f"请求: {current_requests:,}/{REQUESTS_PER_MINUTE_LIMIT:,} ({request_usage_percent:.2f}%)")
-
-        token_limit_triggered = current_tokens > TOKENS_PER_MINUTE_LIMIT * RATE_LIMIT_THRESHOLD
-        request_limit_triggered = current_requests > REQUESTS_PER_MINUTE_LIMIT * RATE_LIMIT_THRESHOLD
-
-        if not token_limit_triggered and not request_limit_triggered:
-            break 
-
-        now = time.time()
-        oldest_ts_in_window = float('inf')
-        found_active_request_in_window = False
-
-        for ts, _ in token_usage_history:
-            if now - ts < 60: 
-                oldest_ts_in_window = ts
-                found_active_request_in_window = True
-                break  
-
-        wait_duration = 1.0 
-        if found_active_request_in_window:
-            time_to_oldest_expiry = (oldest_ts_in_window + 60) - now
-            wait_duration = max(0, time_to_oldest_expiry) + 1.0 
-        else:
-            if token_limit_triggered or request_limit_triggered:
-                 logging.warning("API超限但未在历史记录中找到活跃请求以计算精确等待时间，默认等待1秒。")
-
-        reasons = []
-        if token_limit_triggered:
-            reasons.append(f"Tokens {token_usage_percent:.2f}%")
-        if request_limit_triggered:
-            reasons.append(f"Requests {request_usage_percent:.2f}%")
-        
-        if wait_duration > 0 and (token_limit_triggered or request_limit_triggered):
-            logging.info(f"API使用率超阈值 ({', '.join(reasons)}). 等待 {wait_duration:.2f} 秒...")
-            time.sleep(wait_duration)
-        elif not (token_limit_triggered or request_limit_triggered): 
-            continue 
-        else: 
-            time.sleep(0.1)
-
-    return current_tokens, current_requests
 
 # ===== 日志设置 =====
 def setup_logging():
@@ -167,7 +42,9 @@ def setup_logging():
         format='%(asctime)s %(levelname)s: %(message)s',
         handlers=handlers
     )
-    return logging.getLogger(__name__)
+    logger_instance = logging.getLogger(__name__)
+    logger_instance.info("日志系统初始化完成。") # 简单日志记录
+    return logger_instance
 
 logger = setup_logging()
 
@@ -194,28 +71,28 @@ def extract_full_text(pdf_path, max_pages=30):
         with pdfplumber.open(pdf_path) as pdf:
             text = ""
             # 仅处理前N页以控制API调用中的文本长度
-            max_pages = min(max_pages, len(pdf.pages))
-            for i in range(max_pages):
+            max_pages_to_extract = min(max_pages, len(pdf.pages)) 
+            for i in range(max_pages_to_extract):
                 page_text = extract_page_text(pdf.pages[i])
                 if page_text:
                     text += f"===== 第{i+1}页 =====\n{page_text}\n\n"
             return text
     except Exception as e:
-        logger.error(f"PDF提取文本失败: {e}")
+        logger.error(f"PDF提取文本失败 ({pdf_path}): {e}")
         return None
 
 def find_mdna_position_with_llm(client, pdf_text, file_name):
-    """使用大模型定位MDA部分位置信息，同步方式"""
+    """使用大模型定位MDA部分位置信息，同步方式，带429错误重试机制"""
     if not client or not pdf_text:
+        logger.warning(f"客户端或PDF文本为空，无法定位MDA: {file_name}")
         return None
     
     # 限制文本长度，避免超出API限制
-    if len(pdf_text) > 15000:
-        pdf_text = pdf_text[:15000] + "...(文本已截断)"
+    max_text_len = 15000 
+    if len(pdf_text) > max_text_len:
+        pdf_text = pdf_text[:max_text_len] + "...(文本已截断)"
     
-    try:
-        # 构建提示，只获取位置信息，简化要求以提高成功率
-        prompt = f"""
+    prompt = f"""
 请帮我在以下A股公司年报中定位"管理层讨论与分析"(MDA)部分的精确位置。
 这部分标题可能是："管理层讨论与分析"、"经营情况讨论与分析"、"董事会报告"等。
 
@@ -234,72 +111,105 @@ def find_mdna_position_with_llm(client, pdf_text, file_name):
 年报文本:
 {pdf_text}
 """
-        # 检查和等待token限制
-        wait_for_token_limit() # 调用更新后的函数，不再接收返回值
-        # logger.info(f"当前API使用情况 - Tokens: {current_tokens:,}/{TOKENS_PER_MINUTE_LIMIT:,}, 请求数: {current_requests}/{REQUESTS_PER_MINUTE_LIMIT}") # 此行移除
-        
-        # 预计算输入token
-        input_tokens = count_tokens(prompt)
-        logger.debug(f"API请求输入token数: {input_tokens} (文件: {file_name})")
-        
-        # 调用API
-        logger.info(f"正在使用LLM定位文件MDA位置: {file_name}")
-        start_time = time.time()
-        response = client.chat.completions.create(
-            model=config.LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "你是一个专业的文档定位助手。你只返回JSON格式的位置信息，不返回任何其他文本。"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            max_tokens=500,
-            response_format={"type": "json_object"}  # 请求JSON响应
-        )
-        elapsed = time.time() - start_time
-        
-        # 获取响应文本
-        result = response.choices[0].message.content
-        logger.debug(f"LLM原始响应: {result}")
-        
-        # 记录token使用情况
-        if hasattr(response, 'usage') and response.usage:
-            total_tokens = response.usage.total_tokens
-            logger.info(f"API响应 - 总计使用{total_tokens}个token，响应时间{elapsed:.2f}秒")
-        else:
-            # 如果API没有返回token使用情况，则使用我们的计数器
-            total_tokens = record_token_usage(prompt, result)
-            logger.info(f"API响应 - 估计使用{total_tokens}个token，响应时间{elapsed:.2f}秒")
-        
-        # 尝试多种方式解析位置信息
-        position_info = None
-        
-        # 方法1: 直接尝试解析整个响应为JSON
+    
+    max_retries = 3 # 最大重试次数
+    retry_delay = 30  # 秒
+
+    for attempt in range(max_retries):
         try:
-            position_info = json.loads(result.strip())
-            logger.debug("成功通过直接JSON解析获取位置信息")
-        except Exception as e:
-            logger.debug(f"JSON解析失败: {e}")
-        
-        # 方法2: 如果解析失败，使用默认值
-        if not position_info or not isinstance(position_info, dict):
-            logger.warning(f"无法解析位置信息，使用默认值")
-            position_info = {
-                "start_page": 10,
-                "end_page": 30,
-                "start_keyword": None,
-                "confidence": 0.3
-            }
-        
-        # 验证和调整值
-        if not position_info.get('start_page') or not position_info.get('end_page'):
-            position_info['start_page'] = position_info.get('start_page', 10)
-            position_info['end_page'] = position_info.get('end_page', 30)
-        
-        return position_info
+            logger.debug(f"API请求 (文件: {file_name}), 尝试次数: {attempt + 1}/{max_retries}")
             
-    except Exception as e:
-        logger.error(f"LLM API调用失败: {e}")
-        return None
+            # 调用API
+            logger.info(f"正在使用LLM定位文件MDA位置: {file_name} (尝试 {attempt + 1}/{max_retries})")
+            start_time = time.time()
+            response = client.chat.completions.create(
+                model=config.LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": "你是一个专业的文档定位助手。你只返回JSON格式的位置信息，不返回任何其他文本。"},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=500, 
+                response_format={"type": "json_object"}
+            )
+            elapsed = time.time() - start_time
+            
+            result = response.choices[0].message.content
+            logger.debug(f"LLM原始响应 (文件: {file_name}): {result}")
+            
+            # API响应日志
+            if hasattr(response, 'usage') and response.usage and response.usage.total_tokens is not None:
+                total_tokens_api = response.usage.total_tokens
+                logger.info(f"API响应 (文件: {file_name}) - 总计使用 {total_tokens_api} 个token (来自API)，响应时间 {elapsed:.2f} 秒")
+            else:
+                logger.info(f"API响应 (文件: {file_name}) - 响应时间 {elapsed:.2f} 秒. API未提供token使用情况。")
+
+            # 尝试解析位置信息
+            position_info = None
+            try:
+                position_info = json.loads(result.strip())
+                logger.debug(f"成功通过直接JSON解析获取位置信息 (文件: {file_name})")
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON解析失败 (文件: {file_name}): {e}. 响应内容: {result}")
+            
+            # 验证和调整值
+            if not position_info or not isinstance(position_info, dict) or \
+               not position_info.get('start_page') or not position_info.get('end_page'):
+                logger.warning(f"无法从LLM响应解析有效位置信息或关键字段缺失，将使用默认值 (文件: {file_name})。响应: {result}")
+                position_info = {
+                    "start_page": 10, # 默认值
+                    "end_page": 30,   # 默认值
+                    "start_keyword": "未知 (LLM解析失败)",
+                    "confidence": 0.3 #较低置信度
+                }
+            else:
+                position_info.setdefault('start_keyword', "未知 (LLM未提供)")
+                position_info.setdefault('confidence', 0.5) 
+
+            # 类型转换和校验
+            try:
+                position_info['start_page'] = int(position_info.get('start_page', 10))
+                position_info['end_page'] = int(position_info.get('end_page', 30))
+                position_info['confidence'] = float(position_info.get('confidence', 0.3))
+            except (ValueError, TypeError) as e:
+                logger.warning(f"LLM返回的位置信息字段类型无效，使用默认值 (文件: {file_name}): {e}. 原始值: {position_info}")
+                position_info['start_page'] = 10
+                position_info['end_page'] = 30
+                position_info['confidence'] = 0.3
+            
+            return position_info
+            
+        except OpenAI.RateLimitError as e: 
+            logger.warning(f"API速率限制错误 (429) (文件: {file_name}): {e}. 尝试 {attempt + 1}/{max_retries}. 将在 {retry_delay} 秒后重试...")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"达到最大重试次数 ({max_retries}) 后仍遇速率限制，放弃处理文件: {file_name}")
+                return None 
+        except OpenAI.APIError as e: 
+            logger.error(f"LLM API调用时发生错误 (文件: {file_name}): {e} (类型: {type(e)}). 尝试 {attempt + 1}/{max_retries}.")
+            # 对于其他API错误，可以考虑不同的重试策略或延迟
+            if attempt < max_retries - 1:
+                # logger.info(f"将在 {retry_delay / 2:.1f} 秒后重试 (非速率限制错误)...")
+                # time.sleep(retry_delay / 2) 
+                # 也可以选择不重试或使用与429相同的延迟
+                logger.info(f"将在 {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"达到最大重试次数 ({max_retries}) 后仍遇API错误，放弃处理文件: {file_name}")
+                return None
+        except Exception as e: 
+            logger.error(f"处理LLM请求时发生未知错误 (文件: {file_name}): {e} (类型: {type(e)}).")
+            # 对于未知错误，可能不立即重试，或者只重试一次
+            if attempt < 1 : # 例如，只为未知错误重试一次
+                 logger.info(f"将为未知错误尝试重试一次，在 {retry_delay / 2:.1f} 秒后...")
+                 time.sleep(retry_delay / 2)
+            else:
+                logger.error(f"未知错误发生，已尝试重试，放弃处理文件: {file_name}")
+                return None
+    
+    logger.error(f"所有重试均失败，无法为文件获取LLM位置信息: {file_name}")
+    return None
 
 def process_file(pdf_path, client, output_dir):
     """顺序处理单个PDF文件"""
@@ -307,41 +217,48 @@ def process_file(pdf_path, client, output_dir):
     txt_path = os.path.join(output_dir, os.path.splitext(file_name)[0] + ".txt")
     debug_path = os.path.join(config.DEBUG_REPORTS_DIR, os.path.splitext(file_name)[0] + "_llm_debug.txt")
     
-    # 确保调试目录存在
     os.makedirs(os.path.dirname(debug_path), exist_ok=True)
     
     try:
-        # 检查输出文件是否已存在
         if os.path.exists(txt_path) and os.path.getsize(txt_path) > 0:
             logger.info(f"文件已存在，跳过处理: {file_name}")
             return True
             
-        # 提取PDF文本用于位置识别
-        pdf_text = extract_full_text(pdf_path, max_pages=30)
+        pdf_text = extract_full_text(pdf_path, max_pages=30) # max_pages可以根据需要调整
         if not pdf_text:
             logger.error(f"无法从PDF提取文本: {file_name}")
+            # 写入调试信息表明提取失败
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(f"无法从PDF提取文本用于LLM定位: {file_name}\n")
             return False
         
-        # 使用LLM获取MDA部分位置
         position_info = find_mdna_position_with_llm(client, pdf_text, file_name)
         if not position_info:
-            with open(debug_path, "w", encoding="utf-8") as f:
-                f.write(f"无法获取MDA位置信息: {file_name}")
+            logger.error(f"无法获取MDA位置信息: {file_name}")
+            with open(debug_path, "w", encoding="utf-8") as f: # Overwrite or append based on desired behavior
+                f.write(f"LLM未能提供MDA位置信息: {file_name}\n")
             return False
             
-        # 记录位置信息到调试文件
-        with open(debug_path, "w", encoding="utf-8") as f:
-            f.write(f"MDA位置信息:\n")
-            f.write(f"开始页: {position_info.get('start_page', 'unknown')}\n")
-            f.write(f"结束页: {position_info.get('end_page', 'unknown')}\n")
-            f.write(f"起始关键词: {position_info.get('start_keyword', 'unknown')}\n")
-            f.write(f"置信度: {position_info.get('confidence', 0.0)}\n")
+        with open(debug_path, "w", encoding="utf-8") as f: # Start fresh debug file for this attempt
+            f.write(f"MDA位置信息 (来自LLM):\n")
+            f.write(f"  开始页: {position_info.get('start_page', '未知')}\n")
+            f.write(f"  结束页: {position_info.get('end_page', '未知')}\n")
+            f.write(f"  起始关键词: {position_info.get('start_keyword', '未知')}\n")
+            f.write(f"  置信度: {position_info.get('confidence', 0.0):.2f}\n")
         
-        # 基于1的页码转换为基于0的索引
-        start_page_idx = max(0, int(position_info.get('start_page', 10)) - 1)
-        end_page_idx = max(0, int(position_info.get('end_page', 30)) - 1)
+        start_page_idx = max(0, position_info.get('start_page', 10) - 1) # Default to 10 (page 9 index)
+        end_page_idx = max(0, position_info.get('end_page', 30) - 1)   # Default to 30 (page 29 index)
         
-        # 使用位置信息提取MDA内容
+        if start_page_idx > end_page_idx:
+            logger.warning(f"LLM返回的开始页 ({start_page_idx+1}) 大于结束页 ({end_page_idx+1}) for {file_name}. 尝试交换或使用默认范围.")
+            if position_info.get('confidence', 0.0) < 0.5 : # Example threshold
+                 logger.info(f"置信度低或页码无效，将尝试更广的默认范围 for {file_name}")
+                 start_page_idx = 5 # example broad start
+                 end_page_idx = 50 # example broad end
+            else: # Swap if confidence is reasonable
+                 start_page_idx, end_page_idx = end_page_idx, start_page_idx
+
+
         mda_text = find_mdna_section_with_position(
             pdf_path, 
             start_page_idx,
@@ -349,124 +266,126 @@ def process_file(pdf_path, client, output_dir):
             position_info.get('start_keyword')
         )
         
-        # 检查提取结果
-        if not mda_text or len(mda_text.strip()) < 100:
-            logger.warning(f"根据位置信息无法提取有效内容: {file_name}")
+        min_mda_length = 100 # 最小有效内容长度
+        if not mda_text or len(mda_text.strip()) < min_mda_length:
+            logger.warning(f"根据LLM位置信息无法提取有效内容 (长度 < {min_mda_length}): {file_name}. 尝试备用方法.")
             with open(debug_path, "a", encoding="utf-8") as f:
-                f.write("\n提取失败或内容太少，尝试备用方法...\n")
+                f.write("\n提取失败或内容太少，尝试备用方法 (扩大范围)...\n") # Corrected newline character
             
-            # 备用方法：尝试提取更大范围
             try:
                 with pdfplumber.open(pdf_path) as pdf:
-                    # 扩大提取范围
-                    start = max(0, start_page_idx - 5)
-                    end = min(len(pdf.pages) - 1, end_page_idx + 10)
+                    fallback_start = max(0, start_page_idx - 5) # 扩大范围
+                    fallback_end = min(len(pdf.pages) - 1, end_page_idx + 10) # 扩大范围
                     
-                    # 提取文本
-                    fallback_text = []
-                    for i in range(start, end + 1):
-                        page_text = extract_page_text(pdf.pages[i])
-                        fallback_text.append(page_text)
+                    if fallback_start > fallback_end: # Ensure valid range
+                        fallback_start = 0
+                        fallback_end = min(len(pdf.pages) -1, 50) # Default broad range if still invalid
+
+                    logger.info(f"备用方法：从页 {fallback_start+1} 到 {fallback_end+1} 提取 for {file_name}")
+                    fallback_text_list = []
+                    for i in range(fallback_start, fallback_end + 1):
+                        page_content = extract_page_text(pdf.pages[i])
+                        if page_content:
+                             fallback_text_list.append(page_content)
                     
-                    mda_text = "\n\n".join(fallback_text)
+                    mda_text = "\n\n".join(fallback_text_list)
                     
                     with open(debug_path, "a", encoding="utf-8") as f:
-                        f.write("使用备用方法提取内容\n")
+                        f.write(f"使用备用方法提取内容 (页 {fallback_start+1}-{fallback_end+1}). 内容长度: {len(mda_text)}\n")
             except Exception as e:
-                logger.error(f"备用方法提取失败: {e}")
-                return False
+                logger.error(f"备用方法提取失败 ({file_name}): {e}")
+                with open(debug_path, "a", encoding="utf-8") as f:
+                    f.write(f"备用方法提取失败: {e}\n")
+                # Do not return False yet, check mda_text from primary attempt or if fallback produced something
         
-        if not mda_text or len(mda_text.strip()) < 200:
-            logger.error(f"所有方法都无法提取足够内容: {file_name}")
+        if not mda_text or len(mda_text.strip()) < min_mda_length: # Check again after potential fallback
+            logger.error(f"所有方法都无法提取足够内容 (长度 < {min_mda_length}): {file_name}")
+            with open(debug_path, "a", encoding="utf-8") as f:
+                f.write(f"所有方法均提取内容不足或失败.\n")
             return False
         
-        # 保存结果
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write(mda_text)
         
-        # 更新调试信息
         with open(debug_path, "a", encoding="utf-8") as f:
-            f.write(f"\n提取成功! 内容长度: {len(mda_text)} 字符\n")
+            f.write(f"\n提取成功! 内容长度: {len(mda_text)} 字符. 保存到: {txt_path}\n")
         
         logger.info(f"成功修复并提取: {file_name}")
         return True
         
     except Exception as e:
-        logger.error(f"处理失败: {file_name}, 错误: {e}")
-        # 记录错误到调试文件
+        logger.error(f"处理文件时发生意外错误: {file_name}, 错误: {e}", exc_info=True)
         try:
-            with open(debug_path, "w", encoding="utf-8") as f:
-                f.write(f"处理错误: {str(e)}")
-        except:
-            pass
+            with open(debug_path, "a", encoding="utf-8") as f: # Append to existing debug if error happens late
+                f.write(f"\n处理文件时发生意外错误: {str(e)}\n")
+        except Exception: # Catch specific exception if possible, or general Exception
+            pass # Ignore if cannot write to debug file
         return False
 
 def process_files_sequential(failed_files, output_dir):
     """顺序处理失败文件列表"""
-    # 创建LLM客户端
     client = create_llm_client()
     if not client:
-        logger.error("无法创建LLM客户端，请检查API配置")
-        return 0, len(failed_files)
+        logger.error("无法创建LLM客户端，请检查API配置。中止处理。")
+        return 0, len(failed_files) # No successes, all remaining are fails
     
-    # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     
-    # 过滤已存在的文件
-    filtered_files = []
+    files_to_process = []
     skipped_count = 0
+    initial_fail_count = len(failed_files)
+
     for file_name in failed_files:
         pdf_path = os.path.join(config.PDF_DIR, file_name)
         txt_path = os.path.join(output_dir, os.path.splitext(file_name)[0] + ".txt")
         
-        # 检查PDF文件是否存在
         if not os.path.exists(pdf_path):
-            logger.warning(f"PDF文件不存在: {file_name}")
+            logger.warning(f"PDF文件不存在，跳过: {pdf_path}")
+            skipped_count +=1 # Counts as skipped, will reduce fail_count later
             continue
             
-        # 检查是否已存在处理结果
         if os.path.exists(txt_path) and os.path.getsize(txt_path) > 0:
-            logger.info(f"文件已存在，跳过处理: {file_name}")
+            logger.info(f"输出文件已存在且非空，跳过: {txt_path}")
             skipped_count += 1
             continue
             
-        filtered_files.append(file_name)
+        files_to_process.append(file_name)
     
     if skipped_count > 0:
-        logger.info(f"跳过 {skipped_count} 个已处理的文件")
+        logger.info(f"跳过 {skipped_count} 个文件 (源PDF不存在或输出已存在).")
     
-    if not filtered_files:
-        logger.info("没有需要处理的文件")
-        return skipped_count, 0
+    if not files_to_process:
+        logger.info("没有需要处理的文件。")
+        # All files were skipped, so success is skipped_count, fail is 0 from processing perspective
+        return skipped_count, 0 
     
-    # 显示需要处理的文件数量
-    logger.info(f"需要处理 {len(filtered_files)} 个文件")
-    print(f"需要处理 {len(filtered_files)} 个文件")
+    logger.info(f"需要处理 {len(files_to_process)} 个文件 (总共 {initial_fail_count} 个失败文件，已跳过 {skipped_count}).")
+    print(f"需要处理 {len(files_to_process)} 个文件。")
     
-    # 逐个处理文件
-    success_count = 0
-    fail_count = 0
+    current_success_count = 0
+    current_fail_count = 0
     
-    with tqdm(total=len(filtered_files), desc="处理PDF") as pbar:
-        for file_name in filtered_files:
+    with tqdm(total=len(files_to_process), desc="处理PDF") as pbar:
+        for file_name in files_to_process:
             pdf_path = os.path.join(config.PDF_DIR, file_name)
             
-            # 处理单个文件
             success = process_file(pdf_path, client, output_dir)
             
             if success:
-                success_count += 1
+                current_success_count += 1
             else:
-                fail_count += 1
+                current_fail_count += 1
                 
-            # 更新进度条
             pbar.update(1)
             
-            # 在请求之间添加间隔，避免API限制
-            time.sleep(1.5)
+            # Consider if this sleep is still needed. 
+            # If API calls are frequent even with 429 retries, a small delay can be a good general measure.
+            # If 429s are handled well, this might be less critical.
+            time.sleep(config.POST_REQUEST_DELAY_S) # Using a config value for delay
     
-    # 返回处理结果，包括跳过的文件
-    return success_count + skipped_count, fail_count
+    # Total successes = newly processed + skipped (already successful or non-existent source)
+    # Total fails = newly failed
+    return current_success_count + skipped_count, current_fail_count
 
 def main():
     """主函数：处理所有失败的提取文件"""
@@ -475,95 +394,119 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="仅检查配置，不实际执行")
     args = parser.parse_args()
 
-    # 验证API配置
     if config.LLM_API_KEY == "你的API密钥" and not args.dry_run:
+        # Logger might not be fully set up here if there's an early exit
         print("\n错误: API密钥未配置!")
         print("请在config.py文件中设置有效的LLM_API_KEY后再运行此脚本\n")
+        logger.error("API密钥未配置! 请在config.py中设置。") # Attempt to log as well
         return 1
     
-    print("=== 开始使用LLM顺序修复失败的提取任务 ===")
     logger.info("=== 开始使用LLM顺序修复失败的提取任务 ===")
+    print("=== 开始使用LLM顺序修复失败的提取任务 ===")
     
-    # 创建输出目录
     fixed_output_dir = os.path.join(config.OUT_DIR + "_llm_fixed")
     if not os.path.exists(fixed_output_dir):
         os.makedirs(fixed_output_dir)
         logger.info(f"创建输出目录: {fixed_output_dir}")
     
-    # 检查失败文件列表
+    # Ensure debug directory from config exists
+    if not os.path.exists(config.DEBUG_REPORTS_DIR):
+        os.makedirs(config.DEBUG_REPORTS_DIR)
+        logger.info(f"创建调试报告目录: {config.DEBUG_REPORTS_DIR}")
+
     fail_list_path = args.fail_list if args.fail_list else config.FAIL_LIST_TXT
     if not os.path.exists(fail_list_path):
         logger.error(f"失败文件列表不存在: {fail_list_path}")
         return 1
     
-    # 读取失败文件列表
-    with open(fail_list_path, "r", encoding="utf-8") as f:
-        failed_files = [line.strip() for line in f.readlines() if line.strip()]
-    
-    if not failed_files:
-        logger.info("没有失败的文件需要处理")
+    try:
+        with open(fail_list_path, "r", encoding="utf-8") as f:
+            failed_files_from_list = [line.strip() for line in f.readlines() if line.strip()]
+    except Exception as e:
+        logger.error(f"读取失败文件列表失败 ({fail_list_path}): {e}")
+        return 1
+        
+    if not failed_files_from_list:
+        logger.info("失败文件列表为空，没有文件需要处理。")
         return 0
     
-    # 检查有多少文件已经处理过
-    existing_count = 0
-    for file_name in failed_files:
-        txt_name = os.path.splitext(file_name)[0] + ".txt"
-        txt_path = os.path.join(fixed_output_dir, txt_name)
-        if os.path.exists(txt_path) and os.path.getsize(txt_path) > 0:
-            existing_count += 1
-    
-    logger.info(f"找到 {len(failed_files)} 个失败的文件需要修复，其中 {existing_count} 个已存在处理结果")
-    print(f"找到 {len(failed_files)} 个失败的文件需要修复，其中 {existing_count} 个已存在处理结果")
+    # This initial count of "existing" might be redundant if process_files_sequential handles skipping
+    # logger.info(f"从列表找到 {len(failed_files_from_list)} 个失败的文件记录。")
+    # print(f"从列表找到 {len(failed_files_from_list)} 个失败的文件记录。")
     
     if args.dry_run:
-        logger.info("干运行模式，不执行实际处理")
+        logger.info("干运行模式，不执行实际处理。将检查文件列表和配置。")
+        print("干运行模式，不执行实际处理。")
+        # Optionally, list files that would be processed
         return 0
     
     try:
-        # 开始处理
         start_time = time.time()
         
-        # 顺序处理
-        success_count, fail_count = process_files_sequential(failed_files, fixed_output_dir)
+        total_processed_successfully, total_failed_processing = process_files_sequential(failed_files_from_list, fixed_output_dir)
         
         elapsed_time = time.time() - start_time
         
-        # 输出处理结果
-        logger.info(f"修复处理完成! 成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f}秒")
+        logger.info(f"修复处理完成! 成功处理/跳过: {total_processed_successfully}, 新失败: {total_failed_processing}, 耗时: {elapsed_time:.2f}秒")
         print(f"\n修复处理完成!")
-        print(f"成功: {success_count}, 失败: {fail_count}")
+        print(f"成功处理/跳过: {total_processed_successfully}")
+        print(f"处理中失败: {total_failed_processing}")
         print(f"耗时: {elapsed_time:.2f}秒")
-        print(f"处理速度: {success_count/elapsed_time*60:.1f} 文件/分钟")
         
-        # 更新失败列表（仍然失败的文件）
-        still_failed = []
-        for file_name in failed_files:
+        if total_processed_successfully > 0 and elapsed_time > 0 : # Avoid division by zero
+             # This rate should ideally reflect only newly processed files, not skipped ones.
+             # The current `total_processed_successfully` includes skipped files.
+             # For a more accurate rate, one might need to track new successes separately.
+             # For now, this is a general rate.
+            files_actually_processed = total_processed_successfully - sum(1 for f in failed_files_from_list if os.path.exists(os.path.join(fixed_output_dir, os.path.splitext(f)[0] + ".txt")) and os.path.getsize(os.path.join(fixed_output_dir, os.path.splitext(f)[0] + ".txt")) > 0 and f not in getattr(process_files_sequential, "processed_in_this_run", [])) # Approximation
+            # A better way would be for process_files_sequential to return new_success_count
+            # Assuming total_processed_successfully - skipped_count (if available) or just total_processed_successfully for now.
+            logger.info(f"处理速度 (基于成功和跳过): {total_processed_successfully/elapsed_time*60:.1f} 文件/分钟 (可能包含已跳过文件)")
+            print(f"处理速度 (基于成功和跳过): {total_processed_successfully/elapsed_time*60:.1f} 文件/分钟")
+
+        # Update the list of files that are still considered "failed"
+        still_failed_after_run = []
+        for file_name in failed_files_from_list: # Iterate original list
             txt_name = os.path.splitext(file_name)[0] + ".txt"
             txt_path = os.path.join(fixed_output_dir, txt_name)
-            if not os.path.exists(txt_path) or os.path.getsize(txt_path) == 0:
-                still_failed.append(file_name)
+            pdf_path = os.path.join(config.PDF_DIR, file_name)
+
+            if not os.path.exists(pdf_path): # Source PDF missing, counts as "still failed" in a sense
+                still_failed_after_run.append(f"{file_name} (源PDF文件不存在)")
+            elif not os.path.exists(txt_path) or os.path.getsize(txt_path) == 0:
+                still_failed_after_run.append(file_name)
         
-        if still_failed:
-            still_failed_path = os.path.join(fixed_output_dir, "still_failed.txt")
+        if still_failed_after_run:
+            still_failed_path = os.path.join(fixed_output_dir, "still_failed_after_run.txt")
             with open(still_failed_path, "w", encoding="utf-8") as f:
-                for file_name in still_failed:
-                    f.write(f"{file_name}\n")
-            logger.info(f"仍有 {len(still_failed)} 个文件未能修复，已保存到 {still_failed_path}")
-            print(f"仍有 {len(still_failed)} 个文件未能修复，已保存到 {still_failed_path}")
+                for file_name_status in still_failed_after_run:
+                    f.write(f"{file_name_status}\n")
+            logger.info(f"仍有 {len(still_failed_after_run)} 个文件未能成功生成输出，列表已保存到 {still_failed_path}")
+            print(f"仍有 {len(still_failed_after_run)} 个文件未能成功生成输出，列表已保存到 {still_failed_path}")
         else:
-            logger.info("所有文件都已成功修复！")
-            print("所有文件都已成功修复！")
+            logger.info("所有原始失败列表中的文件现在都有了对应的输出（或源PDF不存在）。")
+            print("所有原始失败列表中的文件现在都有了对应的输出（或源PDF不存在）。")
     
     except KeyboardInterrupt:
         logger.warning("用户中断处理")
         print("\n用户中断处理。已处理的结果已保存。")
-        return 130  # SIGINT的标准返回码
+        return 130 
     except Exception as e:
-        logger.error(f"处理过程出错: {str(e)}")
-        print(f"\n处理过程出错: {str(e)}")
+        logger.error(f"主处理过程发生严重错误: {str(e)}", exc_info=True)
+        print(f"\n处理过程发生严重错误: {str(e)}")
         return 1
     
     return 0
 
 if __name__ == "__main__":
+    # Add a placeholder in config.py if it doesn't exist:
+    # POST_REQUEST_DELAY_S = 1.0 (or whatever default you prefer)
+    if not hasattr(config, 'POST_REQUEST_DELAY_S'):
+        print("提醒: config.py 中缺少 POST_REQUEST_DELAY_S 设置，默认为1.0秒。建议添加此配置。")
+        config.POST_REQUEST_DELAY_S = 1.0 
+    if not hasattr(config, 'DEBUG_REPORTS_DIR'):
+        print("提醒: config.py 中缺少 DEBUG_REPORTS_DIR 设置，默认为 'debug_llm_reports'。建议添加此配置。")
+        config.DEBUG_REPORTS_DIR = "debug_llm_reports"
+
+
     sys.exit(main())
