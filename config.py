@@ -5,10 +5,10 @@ import multiprocessing
 import warnings
 
 # ———— 文件路径配置 ————
-PDF_DIR = "areport/test"  # PDF文件目录
-OUT_DIR = "mdna_txts/test"  # 输出目录
+PDF_DIR = "areport/2013_2537份"  # PDF文件目录
+OUT_DIR = "mdna_txts/2013"  # 输出目录
 LOG_DIR = "logs"  # 日志目录
-FAIL_DIR = "fail/test"  # 失败文件目录
+FAIL_DIR = "fail/2013"  # 失败文件目录
 LOG_PATH = os.path.join(LOG_DIR, "extract_mdna.log")  # 日志文件
 FAIL_LIST_TXT = os.path.join(FAIL_DIR, "fail.txt")  # 失败列表
 DEBUG_REPORTS_DIR = os.path.join(FAIL_DIR, "debug_reports")  # 调试报告保存目录
@@ -23,6 +23,14 @@ SUPPRESS_WARNINGS = True  # 是否抑制所有警告信息
 # ———— 多进程配置 ————
 # 默认使用所有可用CPU核心数, 可自行调整
 CPU_COUNT = multiprocessing.cpu_count()
+
+# ———— LLM API配置 ————
+# API密钥，使用前请替换为你的实际密钥
+LLM_API_KEY = "你的API密钥"
+# API基础URL
+LLM_BASE_URL = "https://api.siliconflow.cn/v1"
+# 使用的模型名称
+LLM_MODEL = "deepseek-ai/DeepSeek-V3"
 
 # ———— OCR配置 ————
 USE_OCR = True  # 是否使用OCR处理低质量文本
