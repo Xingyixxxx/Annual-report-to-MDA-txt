@@ -30,7 +30,7 @@ LLM_API_KEY = "你的API密钥"
 # API基础URL
 LLM_BASE_URL = "https://api.siliconflow.cn/v1"
 # 使用的模型名称
-LLM_MODEL = "deepseek-ai/DeepSeek-V3"
+LLM_MODEL = "Pro/deepseek-ai/DeepSeek-V3"
 
 # ———— OCR配置 ————
 USE_OCR = True  # 是否使用OCR处理低质量文本
