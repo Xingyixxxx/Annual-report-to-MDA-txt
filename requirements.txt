@@ -1,0 +1,6 @@
+pdfplumber>=0.7.0
+pytesseract>=0.3.8
+Pillow>=8.3.1
+tqdm>=4.62.3
+openai>=1.0.0
+colorama>=0.4.4  # 添加用于调试工具的彩色输出
