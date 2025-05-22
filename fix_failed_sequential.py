@@ -25,105 +25,131 @@ from tqdm import tqdm
 from openai import OpenAI
 import config
 from extract import extract_page_text, find_mdna_section_with_position
+from collections import deque
 import transformers  # 添加transformers依赖
-from collections import deque  # 用于记录token使用量
 
-# ===== Token计数器设置 =====
+# ===== Token计数器及速率限制设置 =====
+# 全局定义相关常量和历史记录
+TOKENS_PER_MINUTE_LIMIT = 5000000  # DeepSeek-V3每分钟token限制
+REQUESTS_PER_MINUTE_LIMIT = 30000  # DeepSeek-V3每分钟请求数量限制
+RATE_LIMIT_THRESHOLD = 0.85  # 触发等待的API使用率阈值
+# token_usage_history 需要能容纳至少一分钟内最大请求数
+token_usage_history = deque(maxlen=REQUESTS_PER_MINUTE_LIMIT + 5000) # 例如 30000 + 5000 = 35000
+
+# 全局tokenizer变量
+tokenizer = None
+TOKEN_COUNTER_LOADED = False
+
+# 注意: 以下日志记录依赖于 logging 模块的基本配置或已由 setup_logging() 配置的 logger 实例。
+# 如果 setup_logging() 在此之后调用，这些早期日志可能行为不同。
+
 try:
-    # 加载DeepSeek-V3 tokenizer
     tokenizer_dir = os.path.join(os.path.dirname(__file__), "deepseek_v3_tokenizer")
-    tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
+    _tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)
+    tokenizer = _tokenizer 
+    TOKEN_COUNTER_LOADED = True
+    logging.info("Token计数器初始化成功 (DeepSeek-V3).")
+except Exception as e:
+    logging.warning(f"警告: Token计数器 (DeepSeek-V3) 初始化失败 - {e}")
+    logging.warning("将使用估计方式计算token。请求速率限制仍将按配置工作。")
+    TOKEN_COUNTER_LOADED = False
 
-    # Token使用跟踪变量
-    token_usage_history = deque(maxlen=1000)  # 存储最近1000次请求的token使用记录
-    TOKENS_PER_MINUTE_LIMIT = 5000000  # DeepSeek-V3每分钟token限制
-    REQUESTS_PER_MINUTE_LIMIT = 30000  # DeepSeek-V3每分钟请求数量限制
-    
-    def count_tokens(text):
-        """使用DeepSeek-V3 tokenizer计算文本的token数量"""
-        if not text:
-            return 0
-        try:
-            tokens = tokenizer.encode(text)
-            return len(tokens)
-        except Exception as e:
-            print(f"Token计算错误: {e}")
-            # 如果tokenizer失败，使用近似估计（每4个字符大约1个token）
-            return len(text) // 4
-            
-    def get_current_token_usage():
-        """获取当前一分钟内的总token使用量"""
-        now = time.time()
-        # 只统计过去一分钟内的token使用
-        recent_usage = [tokens for timestamp, tokens in token_usage_history if now - timestamp < 60]
-        return sum(recent_usage)
-    
-    def get_current_request_count():
-        """获取当前一分钟内的请求次数"""
-        now = time.time()
-        return sum(1 for timestamp, _ in token_usage_history if now - timestamp < 60)
-    
-    def record_token_usage(input_text, output_text=None):
-        """记录API调用使用的token数量"""
-        input_tokens = count_tokens(input_text)
-        output_tokens = count_tokens(output_text) if output_text else 0
-        total_tokens = input_tokens + output_tokens
-        
-        # 记录使用时间和token数
-        token_usage_history.append((time.time(), total_tokens))
-        return total_tokens
-    
-    def wait_for_token_limit():
-        """如果接近token限制，等待适当时间"""
+def count_tokens_real(text_to_count):
+    """使用实际加载的tokenizer计算token，带异常处理"""
+    if not text_to_count:
+        return 0
+    if not tokenizer: 
+        logging.warning("尝试使用实际tokenizer计数，但tokenizer未加载。返回估计值。")
+        return len(text_to_count) // 4
+    try:
+        tokens = tokenizer.encode(text_to_count)
+        return len(tokens)
+    except Exception as e:
+        logging.warning(f"使用DeepSeek-V3 tokenizer计算Token时出错: {e}. 对此文本回退到估计值。")
+        return len(text_to_count) // 4
+
+def count_tokens(text_to_count):
+    """根据TOKEN_COUNTER_LOADED状态选择真实计数或估算"""
+    if not text_to_count:
+        return 0
+    if TOKEN_COUNTER_LOADED and tokenizer: # Ensure tokenizer is not None
+        return count_tokens_real(text_to_count)
+    else:
+        return len(text_to_count) // 4
+
+def get_current_token_usage():
+    """获取当前一分钟内的总token使用量"""
+    now = time.time()
+    recent_usage = [tokens for timestamp, tokens in token_usage_history if now - timestamp < 60]
+    return sum(recent_usage)
+
+def get_current_request_count():
+    """获取当前一分钟内的请求次数"""
+    now = time.time()
+    return sum(1 for timestamp, _ in token_usage_history if now - timestamp < 60)
+
+def record_token_usage(input_text, output_text=None):
+    """记录API调用使用的token数量，并更新历史记录"""
+    input_tokens = count_tokens(input_text)
+    output_tokens = count_tokens(output_text) if output_text else 0
+    total_tokens = input_tokens + output_tokens
+    token_usage_history.append((time.time(), total_tokens))
+    return total_tokens
+
+def wait_for_token_limit():
+    """
+    检查API使用是否接近限制，如果接近则等待适当时间。
+    循环检查，直到用量低于阈值。
+    """
+    while True:
         current_tokens = get_current_token_usage()
         current_requests = get_current_request_count()
-        
-        # 检查是否接近限制
-        token_usage_ratio = current_tokens / TOKENS_PER_MINUTE_LIMIT
-        request_usage_ratio = current_requests / REQUESTS_PER_MINUTE_LIMIT
-        
-        # 如果使用率超过85%，开始等待
-        wait_seconds = 0
-        
-        if token_usage_ratio > 0.85:
-            # 根据使用率计算等待时间
-            token_wait = int(60 * (token_usage_ratio - 0.8) * 5)  # 0.85->15秒, 0.9->30秒, 0.95->45秒
-            wait_seconds = max(wait_seconds, token_wait)
-            
-        if request_usage_ratio > 0.85:
-            # 同样根据请求使用率计算等待时间
-            request_wait = int(60 * (request_usage_ratio - 0.8) * 5)
-            wait_seconds = max(wait_seconds, request_wait)
-            
-        if wait_seconds > 0:
-            print(f"接近请求限制，等待 {wait_seconds} 秒... (Token使用率: {token_usage_ratio:.2f}, 请求使用率: {request_usage_ratio:.2f})")
-            time.sleep(wait_seconds)
-            
-        return current_tokens, current_requests
-            
-    TOKEN_COUNTER_LOADED = True
-    print("Token计数器初始化成功")
 
-except Exception as e:
-    print(f"警告: Token计数器初始化失败 - {e}")
-    print("继续使用估计的token计算方式")
-    TOKEN_COUNTER_LOADED = False
-    
-    # 提供一个降级的计数方法
-    def count_tokens(text):
-        """简单估计token数量（大约4个字符一个token）"""
-        if not text:
-            return 0
-        return len(text) // 4
+        token_usage_percent = (current_tokens / TOKENS_PER_MINUTE_LIMIT) * 100 if TOKENS_PER_MINUTE_LIMIT > 0 else 0
+        request_usage_percent = (current_requests / REQUESTS_PER_MINUTE_LIMIT) * 100 if REQUESTS_PER_MINUTE_LIMIT > 0 else 0
         
-    def record_token_usage(input_text, output_text=None):
-        """降级的token记录方法"""
-        return count_tokens(input_text) + count_tokens(output_text)
+        # logging.debug(f"当前API使用 - Tokens: {current_tokens:,}/{TOKENS_PER_MINUTE_LIMIT:,} ({token_usage_percent:.2f}%), "
+        #             f"请求: {current_requests:,}/{REQUESTS_PER_MINUTE_LIMIT:,} ({request_usage_percent:.2f}%)")
+
+        token_limit_triggered = current_tokens > TOKENS_PER_MINUTE_LIMIT * RATE_LIMIT_THRESHOLD
+        request_limit_triggered = current_requests > REQUESTS_PER_MINUTE_LIMIT * RATE_LIMIT_THRESHOLD
+
+        if not token_limit_triggered and not request_limit_triggered:
+            break 
+
+        now = time.time()
+        oldest_ts_in_window = float('inf')
+        found_active_request_in_window = False
+
+        for ts, _ in token_usage_history:
+            if now - ts < 60: 
+                oldest_ts_in_window = ts
+                found_active_request_in_window = True
+                break  
+
+        wait_duration = 1.0 
+        if found_active_request_in_window:
+            time_to_oldest_expiry = (oldest_ts_in_window + 60) - now
+            wait_duration = max(0, time_to_oldest_expiry) + 1.0 
+        else:
+            if token_limit_triggered or request_limit_triggered:
+                 logging.warning("API超限但未在历史记录中找到活跃请求以计算精确等待时间，默认等待1秒。")
+
+        reasons = []
+        if token_limit_triggered:
+            reasons.append(f"Tokens {token_usage_percent:.2f}%")
+        if request_limit_triggered:
+            reasons.append(f"Requests {request_usage_percent:.2f}%")
         
-    def wait_for_token_limit():
-        """简单等待以避免限流"""
-        time.sleep(1)  # 简单地等待1秒
-        return 0, 0
+        if wait_duration > 0 and (token_limit_triggered or request_limit_triggered):
+            logging.info(f"API使用率超阈值 ({', '.join(reasons)}). 等待 {wait_duration:.2f} 秒...")
+            time.sleep(wait_duration)
+        elif not (token_limit_triggered or request_limit_triggered): 
+            continue 
+        else: 
+            time.sleep(0.1)
+
+    return current_tokens, current_requests
 
 # ===== 日志设置 =====
 def setup_logging():
@@ -209,8 +235,8 @@ def find_mdna_position_with_llm(client, pdf_text, file_name):
 {pdf_text}
 """
         # 检查和等待token限制
-        current_tokens, current_requests = wait_for_token_limit()
-        logger.info(f"当前API使用情况 - Tokens: {current_tokens:,}/{TOKENS_PER_MINUTE_LIMIT:,}, 请求数: {current_requests}/{REQUESTS_PER_MINUTE_LIMIT}")
+        wait_for_token_limit() # 调用更新后的函数，不再接收返回值
+        # logger.info(f"当前API使用情况 - Tokens: {current_tokens:,}/{TOKENS_PER_MINUTE_LIMIT:,}, 请求数: {current_requests}/{REQUESTS_PER_MINUTE_LIMIT}") # 此行移除
         
         # 预计算输入token
         input_tokens = count_tokens(prompt)

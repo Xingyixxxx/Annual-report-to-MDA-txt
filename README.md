@@ -57,9 +57,7 @@ python extract.py
 # 此步骤会在OUT_DIR目录下生成提取结果，并在FAIL_DIR中生成失败文件列表
 
 # 步骤2：使用API修复失败的文件
-python fix_failed_extractions.py  # 同步模式
-# 或使用异步模式（更高效）
-python fix_failed_extractions.py --async-mode --workers 5
+python fix_failed_sequential.py  # 顺序处理模式，带token计数和限制
 # 修复结果保存在OUT_DIR + "_llm_fixed"目录
 
 # 步骤3：清理文本，移除页码、页眉等干扰信息
@@ -68,17 +66,17 @@ python clean.py
 ```
 
 ### 4. 高级选项
-`fix_failed_extractions.py`支持多种运行模式：
+`fix_failed_sequential.py`支持以下选项：
 
 ```bash
 # 查看帮助信息
-python fix_failed_extractions.py --help
+python fix_failed_sequential.py --help
 
-# 使用异步模式并设置并行工作数（加快处理速度）
-python fix_failed_extractions.py --async-mode --workers 8
+# 使用自定义失败文件列表
+python fix_failed_sequential.py --fail-list path/to/your/fail_list.txt
 
-# 设置API请求频率限制（避免触发限流）
-python fix_failed_extractions.py --async-mode --rate-limit 30
+# 仅检查配置，不实际执行
+python fix_failed_sequential.py --dry-run
 ```
 
 ## 处理流程详解

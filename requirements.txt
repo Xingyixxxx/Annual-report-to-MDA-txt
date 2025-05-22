@@ -7,3 +7,4 @@ colorama>=0.4.4  # 添加用于调试工具的彩色输出
 aiohttp>=3.8.0  # 用于异步HTTP请求
 aiofiles>=0.8.0  # 用于异步文件操作
 tenacity>=8.0.0  # 用于API请求重试机制
+transformers>=4.34.0  # 用于DeepSeek-V3 tokenizer
